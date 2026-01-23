@@ -1,0 +1,380 @@
+#include <stdlib.h>
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "tinyusb.h"
+#include "class/hid/hid_device.h"
+#include "driver/gpio.h"
+#include "serial_auto.h"
+
+#include "driver/rmt_tx.h" 
+#include "esp_log.h" 
+#include "esp_check.h"
+#include "esp_random.h"
+
+#ifndef AUTO_SERIAL
+#define AUTO_SERIAL "PWSWP0001"
+#endif
+
+static const char *TAG = "joystick";
+
+// Define 16 Joystick output buttons 
+#define NUM_BUTTONS 24
+
+//Calculate report size
+#define BUTTON_ARRAY_BYTES ((NUM_BUTTONS + 7) / 8)
+
+// 11 physical pins used 1..11
+#define NUM_PINS 11
+
+//Switches 1..4 - solder descending
+const gpio_num_t button_pins[NUM_PINS] = {   
+    GPIO_NUM_11, GPIO_NUM_10, GPIO_NUM_9, GPIO_NUM_8, 
+    GPIO_NUM_7, GPIO_NUM_6, GPIO_NUM_5, 
+    GPIO_NUM_4, GPIO_NUM_3, GPIO_NUM_2, GPIO_NUM_1
+};
+
+// WS2812 built-in addressable LED
+#define LED_GPIO 21 
+#define LED_COUNT 1
+// WS2812 timing (ns) 
+#define T0H 350 
+#define T0L 800 
+#define T1H 700 
+#define T1L 600 
+#define RES 50000 // reset >50us
+static rmt_channel_handle_t led_chan = NULL; 
+static rmt_encoder_handle_t led_encoder = NULL;
+
+// HID report descriptor for 16-button joystick
+const uint8_t hid_report_descriptor[] = {
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x04,       // Usage (Joystick)
+    0xA1, 0x01,       // Collection (Application)
+    0x05, 0x09,       //   Usage Page (Button)
+    0x19, 0x01,       //   Usage Minimum (Button 1)
+    0x29, 0x18,       //   Usage Maximum (Button 24)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x25, 0x01,       //   Logical Maximum (1)
+    0x95, 0x18,       //   Report Count (24 buttons)
+    0x75, 0x01,       //   Report Size (1 bit)
+    0x81, 0x02,       //   Input (Data, Variable, Absolute)
+    0xC0              // End Collection
+};
+
+#define REPORT_SIZE_BYTES sizeof(hid_report_descriptor)
+
+// String descriptors
+const char* hid_string_descriptor[] = {
+    (char[]){0x09, 0x04},  // Language: English
+    "PilotWisdom",         // Manufacturer
+    "PilotWisdom SwitchPanel",  // Product
+    AUTO_SERIAL,            // Serial
+    "24-Button HID Joystick" // HID Interface
+};
+
+//debounce logic
+//static bool debounce_active = false;
+#define DEBOUNCE_THRESHOLD 3  // Number of stable cycles required
+#define HEARTBEAT_DIVIDER 128 // Heartbeat divider for sending reports
+
+//byte array BUTTON_ARRAY_BYTES bites - used to store buttons state
+static uint8_t buttons[BUTTON_ARRAY_BYTES],  mask[BUTTON_ARRAY_BYTES];
+static uint8_t  staged[BUTTON_ARRAY_BYTES]; //Staged changes ready to apply
+static uint8_t staging_area[DEBOUNCE_THRESHOLD][BUTTON_ARRAY_BYTES]; //array to store transient data
+static bool report_changed = false;
+static uint8_t update_counter = 0;
+//Full mask bytes and partial bits part
+uint8_t full_bytes = NUM_PINS / 8;
+uint8_t remaining_bits = NUM_PINS % 8;
+static bool enable_led = true; //control built-in LED
+
+
+// Configuration descriptor
+#define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
+static const uint8_t hid_configuration_descriptor[] = {
+    TUD_CONFIG_DESCRIPTOR(1, 1, 0, TUSB_DESC_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    TUD_HID_DESCRIPTOR(0, 4, false, sizeof(hid_report_descriptor), 0x81, REPORT_SIZE_BYTES, 10)
+};
+
+// HID callbacks
+uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
+    return hid_report_descriptor;
+}
+
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
+                                hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen) {
+    return 0;
+}
+
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
+                           hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsize) {
+}
+
+const char *tusb_desc_string_serial(void) {
+    return AUTO_SERIAL;
+}
+
+//WS2812 control
+static void ws2812_init(void)
+{
+    rmt_tx_channel_config_t chan_cfg = {
+        .gpio_num = LED_GPIO,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .mem_block_symbols = 64,
+        .resolution_hz = 10 * 1000 * 1000, // 10 MHz → 100 ns ticks
+        .trans_queue_depth = 4,
+    };
+
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&chan_cfg, &led_chan));
+
+    rmt_bytes_encoder_config_t bytes_cfg = {
+        .bit0 = {
+            .duration0 = T0H / 100, .level0 = 1,
+            .duration1 = T0L / 100, .level1 = 0,
+        },
+        .bit1 = {
+            .duration0 = T1H / 100, .level0 = 1,
+            .duration1 = T1L / 100, .level1 = 0,
+        },
+        .flags.msb_first = 1,
+    };
+
+    ESP_ERROR_CHECK(rmt_new_bytes_encoder(&bytes_cfg, &led_encoder));
+    ESP_ERROR_CHECK(rmt_enable(led_chan));
+}
+
+static void ws2812_set_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+    uint8_t buf[3] = { g, r, b }; // WS2812 uses GRB order
+
+    rmt_transmit_config_t tx_cfg = {
+        .loop_count = 0,
+    };
+
+    ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, buf, sizeof(buf), &tx_cfg));
+    ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
+}
+
+//Blink LED briefly to visually confirm reporting
+static void blink(){
+
+    uint32_t rnd = esp_random();
+    uint8_t r = (rnd >> 0) & 0x3F;
+    uint8_t g = (rnd >> 8) & 0x3F;
+    uint8_t b = (rnd >> 16) & 0x3F;
+    //set random color
+    if (enable_led) { ws2812_set_rgb(r, g, b); } 
+    else { ws2812_set_rgb(0, 0, 0); }
+    enable_led = !enable_led;
+}
+
+static void detect_input_change(){ //compare buttons and staged
+    uint8_t result = 0;
+    for (uint8_t i = 0; i < BUTTON_ARRAY_BYTES; i++) {
+        result |= buttons[i] ^ staged[i];
+    }
+    report_changed = (bool) result;
+}
+
+/* Keeping it for future use
+//Update key positions function
+static void update_key_position_buttons(uint8_t *buf, uint8_t left_bit_index, uint8_t right_bit_index, uint8_t base_output_index) {
+    // Extract L and R states
+    uint8_t L = (buf[left_bit_index / 8] >> (left_bit_index % 8)) & 1;
+    uint8_t R = (buf[right_bit_index / 8] >> (right_bit_index % 8)) & 1;
+
+    // Decode key position logic
+    uint8_t Key_Off   = (!L && !R);
+    uint8_t Key_Right = (!L &&  R);
+    uint8_t Key_Left  = ( L && !R);
+    uint8_t Key_Both  = ( L &&  R);
+
+    // Clear output bits
+    for (uint8_t i = 0; i < 4; ++i) {
+        uint8_t bit_index = base_output_index + i;
+        buf[bit_index / 8] &= ~(1 << (bit_index % 8));
+    }
+
+    // Set output bits
+    buf[(base_output_index + 0) / 8] |= Key_Off   << ((base_output_index + 0) % 8);
+    buf[(base_output_index + 1) / 8] |= Key_Right << ((base_output_index + 1) % 8);
+    buf[(base_output_index + 2) / 8] |= Key_Left  << ((base_output_index + 2) % 8);
+    buf[(base_output_index + 3) / 8] |= Key_Both  << ((base_output_index + 3) % 8);
+}
+*/
+
+//read staged states, update stable positions into permanent array
+static void update_button_states_from_stage(){  
+
+    uint8_t stable_mask[BUTTON_ARRAY_BYTES];  // Bits that are stable across all samples
+
+    //find out only unchanged values throughout the DEBOUNCE_THRESHOLD number of reports
+    // Start with all bits assumed stable
+    for (uint8_t byte = 0; byte < BUTTON_ARRAY_BYTES; byte++) {
+        stable_mask[byte] = 0xFF;
+
+        for (uint8_t sample = 1; sample < DEBOUNCE_THRESHOLD; sample++) {
+            // XOR with reference, then invert to get equality mask
+            uint8_t diff = staging_area[0][byte] ^ staging_area[sample][byte];
+            stable_mask[byte] &= ~diff;  // Clear bits that differ
+        }
+    }
+
+    uint8_t stable_values[BUTTON_ARRAY_BYTES];   //Stable bits across the samples
+
+    //Fill in the staged buffer with complete data
+    memcpy(staged, buttons,  BUTTON_ARRAY_BYTES); //copy current state over to staging area
+    for (uint8_t i = 0; i < BUTTON_ARRAY_BYTES; i++) {
+        stable_values[i] = staging_area[0][i] & stable_mask[i];
+        // Clear stable bits in staged, then OR in stable values
+        staged[i] = (staged[i] & ~stable_mask[i]) | (stable_values[i] & stable_mask[i]);        
+    }
+
+    //Recalculate key position bits - no need for this panel
+    //update_key_position_buttons(staged,1,2,2*NUM_PINS);
+
+    //Detect changes and set the flag if anything has changed
+    detect_input_change();
+
+    //Get the report ready to send
+    memcpy(buttons,staged,BUTTON_ARRAY_BYTES);
+    
+}
+
+static void push_to_staging_area(uint8_t *buf) {   //Stage the changes to 
+    for (uint8_t i = DEBOUNCE_THRESHOLD-1; i > 0; i-- ){ // push old values up
+        //staging_area[]
+        memcpy(staging_area[i],staging_area[i-1],BUTTON_ARRAY_BYTES);
+    }
+    memcpy(staging_area[0], buf, BUTTON_ARRAY_BYTES); //fill in the fresh report
+}
+
+//Zero out then read physical pins and set mirror pins
+static void zero_n_read_physical_pins(uint8_t *buf){
+    //Zero out the array
+    memset(buf, 0, BUTTON_ARRAY_BYTES); 
+
+    for (uint8_t i = 0; i < NUM_PINS ; i++) { 
+        if (!gpio_get_level(button_pins[i])) { 
+            // Set actual buttons
+            buf[i / 8]            |=  (1 << (i % 8) ); 
+        }
+        else {
+            // Set mirror buttons
+            buf[(i+NUM_PINS) / 8] |=  (1 << ((i+NUM_PINS) % 8) ); 
+
+        }
+    }
+}
+
+static void calculate_pins_mask(void) {
+    //Create the bitmask for physical pins
+    memset(mask, 0, BUTTON_ARRAY_BYTES);  // Clear all bytes
+
+    // Fill full bytes with 0xFF
+    for (uint8_t i = 0; i < full_bytes; i++) {
+        mask[i] = 0xFF;
+    }
+
+    // Set remaining bits in the last byte
+    if (remaining_bits > 0) {
+        mask[full_bytes] = (1 << remaining_bits) - 1;
+    }
+}
+
+
+//Init first report before the polling loop
+static void init_first_report(void) {
+
+    //Zero out then read physical pins and set mirror pins
+    zero_n_read_physical_pins(buttons);
+
+    //Generate Start key position - unused in this panel
+    //update_key_position_buttons(buttons,1,2,2*NUM_PINS);
+
+    //Generate physical pins bitmask
+    calculate_pins_mask();
+
+    //Ensure clear state for the staging area
+    for (uint8_t i=0; i< DEBOUNCE_THRESHOLD; i++){
+        memset(staging_area[i], 0, BUTTON_ARRAY_BYTES);  // Clear all bytes
+    }
+
+    tud_hid_report(0, &buttons, sizeof(buttons));
+}
+
+// Read buttons and send HID report
+static void send_joystick_report(void) {
+
+    // array to store transient state
+    static uint8_t buttons_temp[BUTTON_ARRAY_BYTES]; 
+    static bool update_due=true;
+
+    //Zero out and read pins + mirror states
+    zero_n_read_physical_pins(buttons_temp);
+
+    //push the changes into staging arrea
+    push_to_staging_area(buttons_temp);
+
+    //calculate the correct final state
+    update_button_states_from_stage();
+
+    //Uncomment to ignore staging
+    //memcpy(buttons,buttons_temp,BUTTON_ARRAY_BYTES);
+    // Send heartbeat every HEARTBEAT_DIVIDER times irrelevant of the changes
+    update_due = ( (update_counter % HEARTBEAT_DIVIDER) == 0);
+    update_counter++;
+
+    if (report_changed || update_due) { 
+        tud_hid_report(0, &buttons, sizeof(buttons)); 
+        blink();
+    }
+
+}
+
+// Main app
+void app_main(void) {
+    // Configure button GPIOs
+    for (uint8_t i = 0; i < NUM_PINS; i++) {
+        gpio_config_t cfg = {
+            .pin_bit_mask = BIT64(button_pins[i]),
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = true,
+            .pull_down_en = false,
+            .intr_type = GPIO_INTR_DISABLE
+        };
+        gpio_config(&cfg);
+    }
+
+    // Initialize USB
+    ESP_LOGI(TAG, "Initializing USB HID");
+    const tinyusb_config_t tusb_cfg = {
+        .device_descriptor = NULL,
+        .string_descriptor = hid_string_descriptor,
+        .string_descriptor_count = sizeof(hid_string_descriptor) / sizeof(hid_string_descriptor[0]),
+        .external_phy = false,
+#if (TUD_OPT_HIGH_SPEED)
+        .fs_configuration_descriptor = hid_configuration_descriptor,
+        .hs_configuration_descriptor = hid_configuration_descriptor,
+        .qualifier_descriptor = NULL,
+#else
+        .configuration_descriptor = hid_configuration_descriptor,
+#endif
+    };
+    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+    ESP_LOGI(TAG, "USB HID ready");
+
+    ws2812_init();
+
+    //Init the joystick state
+    init_first_report();
+
+    // Main loop
+    while (1) {
+        if (tud_hid_ready()) {
+            send_joystick_report();
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}

@@ -1,0 +1,1 @@
+#define AUTO_SERIAL "PWSWP00001"
