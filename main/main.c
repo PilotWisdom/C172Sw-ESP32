@@ -29,9 +29,10 @@ static const char *TAG = "joystick";
 
 //Switches 1..4 - solder descending
 const gpio_num_t button_pins[NUM_PINS] = {   
-    GPIO_NUM_11, GPIO_NUM_10, GPIO_NUM_9, GPIO_NUM_8, 
-    GPIO_NUM_7, GPIO_NUM_6, GPIO_NUM_5, 
-    GPIO_NUM_4, GPIO_NUM_3, GPIO_NUM_2, GPIO_NUM_1
+    GPIO_NUM_1,
+    GPIO_NUM_2, GPIO_NUM_3, GPIO_NUM_4, GPIO_NUM_5, 
+    GPIO_NUM_6, GPIO_NUM_7, GPIO_NUM_8, 
+    GPIO_NUM_9, GPIO_NUM_10, GPIO_NUM_11
 };
 
 // WS2812 built-in addressable LED
