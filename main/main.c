@@ -269,9 +269,6 @@ static void init_first_report(void) {
     //Zero out then read physical pins and set mirror pins
     zero_n_read_physical_pins(buttons);
 
-    //Generate Start key position - unused in this panel
-    //update_key_position_buttons(buttons,1,2,2*NUM_PINS);
-
     //Generate physical pins bitmask
     calculate_pins_mask();
 
@@ -299,8 +296,6 @@ static void send_joystick_report(void) {
     //calculate the correct final state
     update_button_states_from_stage();
 
-    //Uncomment to ignore staging
-    //memcpy(buttons,buttons_temp,BUTTON_ARRAY_BYTES);
     // Send heartbeat every HEARTBEAT_DIVIDER times irrelevant of the changes
     update_due = ( (update_counter % HEARTBEAT_DIVIDER) == 0);
     update_counter++;
