@@ -79,6 +79,7 @@ const char* hid_string_descriptor[] = {
 #define DEBOUNCE_THRESHOLD 3  // Number of stable cycles required
 #define HEARTBEAT_DIVIDER 128 // Heartbeat divider for sending reports
 
+
 //byte array BUTTON_ARRAY_BYTES bites - used to store buttons state
 static uint8_t buttons[BUTTON_ARRAY_BYTES],  mask[BUTTON_ARRAY_BYTES];
 static uint8_t  staged[BUTTON_ARRAY_BYTES]; //Staged changes ready to apply
@@ -115,6 +116,22 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
 const char *tusb_desc_string_serial(void) {
     return AUTO_SERIAL;
 }
+
+//Button state initialization
+void init_buttons(void) {
+    for (uint8_t i = 0; i < NUM_PINS; i++) {
+        gpio_config_t cfg = {
+            .pin_bit_mask = BIT64(button_pins[i]),
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = true,
+            .pull_down_en = false,
+            .intr_type = GPIO_INTR_DISABLE
+        };
+        gpio_config(&cfg);
+        
+    }
+}
+
 
 //WS2812 control
 static void ws2812_init(void)
@@ -309,17 +326,8 @@ static void send_joystick_report(void) {
 
 // Main app
 void app_main(void) {
-    // Configure button GPIOs
-    for (uint8_t i = 0; i < NUM_PINS; i++) {
-        gpio_config_t cfg = {
-            .pin_bit_mask = BIT64(button_pins[i]),
-            .mode = GPIO_MODE_INPUT,
-            .pull_up_en = true,
-            .pull_down_en = false,
-            .intr_type = GPIO_INTR_DISABLE
-        };
-        gpio_config(&cfg);
-    }
+   // Configure button GPIOs
+   init_buttons();
 
     // Initialize USB
     ESP_LOGI(TAG, "Initializing USB HID");
