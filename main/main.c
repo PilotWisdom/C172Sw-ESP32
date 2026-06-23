@@ -186,33 +186,6 @@ static void detect_input_change(){ //compare buttons and staged
     report_changed = (bool) result;
 }
 
-/* Keeping it for future use
-//Update key positions function
-static void update_key_position_buttons(uint8_t *buf, uint8_t left_bit_index, uint8_t right_bit_index, uint8_t base_output_index) {
-    // Extract L and R states
-    uint8_t L = (buf[left_bit_index / 8] >> (left_bit_index % 8)) & 1;
-    uint8_t R = (buf[right_bit_index / 8] >> (right_bit_index % 8)) & 1;
-
-    // Decode key position logic
-    uint8_t Key_Off   = (!L && !R);
-    uint8_t Key_Right = (!L &&  R);
-    uint8_t Key_Left  = ( L && !R);
-    uint8_t Key_Both  = ( L &&  R);
-
-    // Clear output bits
-    for (uint8_t i = 0; i < 4; ++i) {
-        uint8_t bit_index = base_output_index + i;
-        buf[bit_index / 8] &= ~(1 << (bit_index % 8));
-    }
-
-    // Set output bits
-    buf[(base_output_index + 0) / 8] |= Key_Off   << ((base_output_index + 0) % 8);
-    buf[(base_output_index + 1) / 8] |= Key_Right << ((base_output_index + 1) % 8);
-    buf[(base_output_index + 2) / 8] |= Key_Left  << ((base_output_index + 2) % 8);
-    buf[(base_output_index + 3) / 8] |= Key_Both  << ((base_output_index + 3) % 8);
-}
-*/
-
 //read staged states, update stable positions into permanent array
 static void update_button_states_from_stage(){  
 
@@ -239,9 +212,6 @@ static void update_button_states_from_stage(){
         // Clear stable bits in staged, then OR in stable values
         staged[i] = (staged[i] & ~stable_mask[i]) | (stable_values[i] & stable_mask[i]);        
     }
-
-    //Recalculate key position bits - no need for this panel
-    //update_key_position_buttons(staged,1,2,2*NUM_PINS);
 
     //Detect changes and set the flag if anything has changed
     detect_input_change();
