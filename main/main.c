@@ -157,18 +157,26 @@ static void ws2812_set_rgb(uint8_t r, uint8_t g, uint8_t b)
     ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
 }
 
-//Blink LED briefly to visually confirm reporting
-static void blink(){
+// Blink LED briefly to visually confirm reporting
+static void blink() {
+    uint8_t r, g, b;
 
-    uint32_t rnd = esp_random();
-    uint8_t r = (rnd >> 0) & 0x3F;
-    uint8_t g = (rnd >> 8) & 0x3F;
-    uint8_t b = (rnd >> 16) & 0x3F;
-    //set random color
-    if (enable_led) { ws2812_set_rgb(r, g, b); } 
-    else { ws2812_set_rgb(0, 0, 0); }
+    // Loop until at least one of the color components is non-zero
+    do {
+        uint32_t rnd = esp_random();
+        r = (rnd >> 5) % 5 * 16;
+        g = (rnd >> 10) % 5 * 16;
+        b = (rnd >> 15) % 5 * 16;
+    } while (r == 0 && g == 0 && b == 0);
+
+    if (enable_led) {
+        ws2812_set_rgb(r, g, b);
+    } else {
+        ws2812_set_rgb(0, 0, 0);
+    }
     enable_led = !enable_led;
 }
+
 
 static void detect_input_change(){ //compare buttons and staged
     uint8_t result = 0;
